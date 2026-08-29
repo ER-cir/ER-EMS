@@ -617,6 +617,11 @@
         }
     </style>
 
+
+    <!-- Socket.IO & QRCode CDNs for Real-time Multi-device Sync -->
+        <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+
 </head>
 <body class="h-screen w-screen flex flex-col justify-between select-none bg-slate-100">
 
@@ -652,6 +657,18 @@
             <div class="text-xs font-semibold text-slate-700 bg-slate-100 px-3 py-1.5 rounded-lg border border-slate-300">
                 สไลด์ <span id="currentSlideNum" class="text-emerald-700 font-bold text-sm">1</span> / <span id="totalSlidesNum">32</span>
             </div>
+
+            <!-- Online Sync Status Indicator -->
+            <div id="syncStatusBadge" onclick="openShareModal()" title="คลิกเพื่อดูการเชื่อมต่อและแชร์ลิงก์ให้อุปกรณ์อื่น" class="px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition bg-slate-100 border-slate-300 text-slate-600 hover:bg-slate-200">
+                <span id="syncStatusDot" class="w-2 h-2 rounded-full bg-slate-400 animate-pulse"></span>
+                <span id="syncStatusText" class="hidden md:inline text-[11px]">เชื่อมต่อออนไลน์</span>
+            </div>
+
+            <!-- Share Online Button -->
+            <button id="openShareBtn" onclick="openShareModal()" title="แชร์ลิงก์ / QR Code สำหรับเปิดใช้งานบนเครื่องอื่น" class="px-3 py-1.5 bg-blue-50 hover:bg-blue-100 text-blue-800 text-xs font-semibold rounded-lg border border-blue-300 transition flex items-center gap-1.5 cursor-pointer">
+                <i class="fa-solid fa-tower-broadcast text-blue-600 animate-pulse"></i>
+                <span class="hidden sm:inline">แชร์ออนไลน์</span>
+            </button>
 
             <!-- Slide Edit Mode Toggle Button -->
             <button id="toggleGlobalEditBtn" onclick="toggleEditMode()" title="เปิด/ปิดโหมดแก้ไขข้อความ (Edit Mode)" class="px-3 py-1.5 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 text-xs font-semibold rounded-lg border border-emerald-300 transition flex items-center gap-1.5 cursor-pointer">
@@ -4585,15 +4602,28 @@
             const host = clone.querySelector('.slide-edit-controls-host');
             if (host) host.remove();
 
-            slideEdits[currentSlide] = clone.innerHTML;
+            const cleanContent = clone.innerHTML;
+            slideEdits[currentSlide] = cleanContent;
+            
             try {
                 localStorage.setItem(STORAGE_KEY_SLIDE_EDITS, JSON.stringify(slideEdits));
             } catch (e) {
                 console.warn('LocalStorage save error:', e);
             }
 
+            // Real-time broadcast to server & other devices
+            if (syncSocket && syncSocket.connected) {
+                syncSocket.emit('slide:update', {
+                    slideNum: currentSlide,
+                    content: cleanContent,
+                    senderId: CLIENT_ID,
+                    author: 'เครื่องนำเสนอ'
+                });
+            }
+
             if (!silent) {
-                showToast(`💾 บันทึกการแก้ไขสไลด์ที่ ${currentSlide} เรียบร้อยแล้ว`);
+                const syncMsg = (syncSocket && syncSocket.connected) ? ' (ซิงค์ไปยังเครื่องอื่นเรียบร้อย ⚡)' : '';
+                showToast(`💾 บันทึกสไลด์ที่ ${currentSlide} เรียบร้อย${syncMsg}`, 'success');
             }
         }
         window.saveCurrentSlideEdits = saveCurrentSlideEdits;
@@ -4613,11 +4643,19 @@
                     localStorage.setItem(STORAGE_KEY_SLIDE_EDITS, JSON.stringify(slideEdits));
                 } catch (e) {}
 
+                // Broadcast reset to server & other devices
+                if (syncSocket && syncSocket.connected) {
+                    syncSocket.emit('slide:reset', {
+                        slideNum: slideNum,
+                        senderId: CLIENT_ID
+                    });
+                }
+
                 if (isEditMode) {
                     updateContentEditableState();
                 }
 
-                showToast(`🔄 คืนค่าเริ่มต้นสไลด์ที่ ${slideNum} เรียบร้อยแล้ว`);
+                showToast(`🔄 คืนค่าเริ่มต้นสไลด์ที่ ${slideNum} เรียบร้อยแล้ว`, 'info');
             }
         }
         window.resetCurrentSlideEdits = resetCurrentSlideEdits;
@@ -4664,6 +4702,89 @@
             document.execCommand('hiliteColor', false, color);
             document.execCommand('backColor', false, color);
         }
+        
+        let savedRange = null;
+
+        function saveSelectionRange() {
+            const sel = window.getSelection();
+            if (sel && sel.rangeCount > 0) {
+                savedRange = sel.getRangeAt(0).cloneRange();
+            }
+        }
+
+        function restoreSelectionRange() {
+            if (savedRange) {
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(savedRange);
+            }
+        }
+
+        function applyPresetFontSize(sizeStr) {
+            if (!sizeStr) return;
+            restoreSelectionRange();
+            changeSelectedFontSize(sizeStr);
+        }
+        window.applyPresetFontSize = applyPresetFontSize;
+        window.saveSelectionRange = saveSelectionRange;
+
+        function changeSelectedFontSize(deltaOrSize) {
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) return;
+
+            const range = selection.getRangeAt(0);
+
+            // Case A: No text selected, cursor inside editable element
+            if (range.collapsed) {
+                let node = selection.anchorNode;
+                if (node && node.nodeType === Node.TEXT_NODE) node = node.parentElement;
+                if (node && node.isContentEditable) {
+                    const currentSize = parseInt(window.getComputedStyle(node).fontSize, 10) || 14;
+                    let newSize;
+                    if (typeof deltaOrSize === 'number') {
+                        newSize = Math.max(9, Math.min(80, currentSize + deltaOrSize));
+                    } else {
+                        newSize = parseInt(deltaOrSize, 10);
+                    }
+                    node.style.fontSize = newSize + 'px';
+                    saveCurrentSlideEdits(true);
+                    showToast(`🔠 ปรับขนาดตัวอักษรเป็น ${newSize}px`, 'info');
+                }
+                return;
+            }
+
+            // Case B: Highlighted text selection
+            let parentEl = range.commonAncestorContainer;
+            if (parentEl.nodeType === Node.TEXT_NODE) parentEl = parentEl.parentElement;
+            const currentParentSize = parseInt(window.getComputedStyle(parentEl).fontSize, 10) || 14;
+
+            let newSize;
+            if (typeof deltaOrSize === 'number') {
+                newSize = Math.max(9, Math.min(80, currentParentSize + deltaOrSize));
+            } else {
+                newSize = parseInt(deltaOrSize, 10);
+            }
+
+            try {
+                const span = document.createElement('span');
+                span.style.fontSize = newSize + 'px';
+                span.appendChild(range.extractContents());
+                range.insertNode(span);
+
+                selection.removeAllRanges();
+                const newRange = document.createRange();
+                newRange.selectNodeContents(span);
+                selection.addRange(newRange);
+                savedRange = newRange.cloneRange();
+
+                saveCurrentSlideEdits(true);
+                showToast(`🔠 ปรับขนาดข้อความที่เลือกเป็น ${newSize}px`, 'info');
+            } catch (err) {
+                console.warn('Font size change fallback error:', err);
+            }
+        }
+        window.changeSelectedFontSize = changeSelectedFontSize;
+    
         function applyTextColor(color = '#059669') {
             document.execCommand('foreColor', false, color);
         }
@@ -4671,6 +4792,279 @@
         window.applyTextColor = applyTextColor;
 
         // =========================================================================
+        
+        // =========================================================================
+        // REAL-TIME MULTI-DEVICE ONLINE SYNCHRONIZATION SYSTEM
+        // =========================================================================
+        const CLIENT_ID = 'client_' + Math.random().toString(36).substring(2, 9);
+        let syncSocket = null;
+        let isOnlineSyncActive = false;
+        let activeClientsCount = 1;
+        let serverNetworkIps = [];
+        let serverPublicUrl = null;
+        let serverPublicIp = null;
+        let serverPort = 3000;
+        let activeQrCodeType = 'public';
+        let autoSyncDebounceTimer = null;
+
+        function updateSyncStatus(status, clientCount = 1, ips = [], port = 3000) {
+            const badge = document.getElementById('syncStatusBadge');
+            const dot = document.getElementById('syncStatusDot');
+            const text = document.getElementById('syncStatusText');
+            const modalDot = document.getElementById('modalStatusDot');
+            const modalTitle = document.getElementById('modalStatusTitle');
+            const modalDetail = document.getElementById('modalStatusDetail');
+            const clientsBadge = document.getElementById('activeClientsBadge');
+            
+            if (ips && ips.length > 0) serverNetworkIps = ips;
+            if (port) serverPort = port;
+            if (clientCount) activeClientsCount = clientCount;
+
+            if (status === 'online') {
+                isOnlineSyncActive = true;
+                if (badge) badge.className = 'px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition bg-emerald-50 border-emerald-300 text-emerald-800 hover:bg-emerald-100 shadow-2xs';
+                if (dot) dot.className = 'w-2 h-2 rounded-full bg-emerald-500 shadow-xs shadow-emerald-500/50 animate-pulse';
+                if (text) text.textContent = `🟢 ออนไลน์ (${activeClientsCount} เครื่อง)`;
+                
+                if (modalDot) modalDot.className = 'w-3.5 h-3.5 rounded-full bg-emerald-500 shadow-xs shadow-emerald-500/50 animate-pulse';
+                if (modalTitle) modalTitle.textContent = 'สถานะการเชื่อมต่อ: ออนไลน์ (Real-time Sync Active)';
+                if (modalDetail) modalDetail.textContent = `เชื่อมต่อเรียบร้อย มีผู้ใช้งานร่วมกัน ${activeClientsCount} เครื่อง`;
+                if (clientsBadge) clientsBadge.textContent = `🟢 ออนไลน์ ${activeClientsCount} เครื่อง`;
+                
+                renderShareLinks();
+            } else {
+                isOnlineSyncActive = false;
+                if (badge) badge.className = 'px-2.5 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition bg-slate-100 border-slate-300 text-slate-600 hover:bg-slate-200';
+                if (dot) dot.className = 'w-2 h-2 rounded-full bg-slate-400';
+                if (text) text.textContent = 'โหมดออฟไลน์';
+
+                if (modalDot) modalDot.className = 'w-3.5 h-3.5 rounded-full bg-slate-400';
+                if (modalTitle) modalTitle.textContent = 'สถานะการเชื่อมต่อ: โหมดออฟไลน์ (Local)';
+                if (modalDetail) modalDetail.textContent = 'บันทึกข้อมูลในเครื่อง (LocalStorage) หากต้องการซิงค์หลายเครื่อง ให้รัน npm start';
+                if (clientsBadge) clientsBadge.textContent = '⚪ ออฟไลน์';
+            }
+        }
+
+        function renderShareLinks() {
+            const localInput = document.getElementById('localUrlInput');
+            const localText = document.getElementById('localUrlText');
+            const netInput = document.getElementById('networkUrlInput');
+            const publicInput = document.getElementById('publicUrlInput');
+            const ipBadge = document.getElementById('publicIpBadge');
+            const container = document.getElementById('qrcodeContainer');
+            const qrDesc = document.getElementById('qrTypeDescription');
+            const tabPublic = document.getElementById('qrTabPublic');
+            const tabLan = document.getElementById('qrTabLan');
+
+            const currentPort = window.location.port || serverPort || 3000;
+            const currentHost = window.location.hostname || 'localhost';
+
+            const localUrl = `http://localhost:${currentPort}`;
+            let lanUrl = (serverNetworkIps.length > 0) ? `http://${serverNetworkIps[0]}:${currentPort}` : localUrl;
+            let publicUrl = serverPublicUrl || (window.location.origin.startsWith('https') ? window.location.origin : null);
+
+            if (localInput) localInput.value = localUrl;
+            if (localText) localText.textContent = localUrl;
+            if (netInput) netInput.value = lanUrl;
+            
+            if (publicInput) {
+                if (publicUrl) {
+                    publicInput.value = publicUrl;
+                } else {
+                    publicInput.value = 'รอการสร้างลิงก์ (หรือใช้ลิงก์ Wi-Fi ด้านล่าง)';
+                }
+            }
+
+            if (ipBadge) {
+                ipBadge.textContent = serverPublicIp || 'ไม่ระบุ';
+            }
+
+            // Determine target QR URL based on active tab
+            let qrTargetUrl = (activeQrCodeType === 'public' && publicUrl) ? publicUrl : lanUrl;
+
+            if (activeQrCodeType === 'public' && publicUrl) {
+                if (tabPublic) tabPublic.className = 'px-2 py-1 rounded-md bg-white text-emerald-800 shadow-2xs font-bold cursor-pointer transition';
+                if (tabLan) tabLan.className = 'px-2 py-1 rounded-md text-slate-600 hover:text-slate-900 cursor-pointer transition';
+                if (qrDesc) qrDesc.innerHTML = 'สแกนด้วยมือถือ 4G/5G หรือเน็ตบ้าน เพื่อเปิดแก้ไขร่วมกันได้ทั่วโลก 🌍';
+            } else {
+                if (tabPublic) tabPublic.className = 'px-2 py-1 rounded-md text-slate-600 hover:text-slate-900 cursor-pointer transition';
+                if (tabLan) tabLan.className = 'px-2 py-1 rounded-md bg-white text-blue-800 shadow-2xs font-bold cursor-pointer transition';
+                if (qrDesc) qrDesc.innerHTML = 'สแกนด้วยอุปกรณ์ในวง Wi-Fi เดียวกัน 📶';
+            }
+
+            // Generate QRCode
+            if (container && typeof QRCode !== 'undefined') {
+                container.innerHTML = '';
+                new QRCode(container, {
+                    text: qrTargetUrl,
+                    width: 130,
+                    height: 130,
+                    colorDark: "#0f172a",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.M
+                });
+            }
+        }
+
+        function switchQrCodeType(type) {
+            activeQrCodeType = type;
+            renderShareLinks();
+        }
+        window.switchQrCodeType = switchQrCodeType;
+
+        function copyPublicIp() {
+            if (serverPublicIp) {
+                navigator.clipboard.writeText(serverPublicIp).then(() => {
+                    showToast(`🔑 คัดลอก IP: ${serverPublicIp} เรียบร้อย`, 'success');
+                }).catch(() => {
+                    showToast(`🔑 IP: ${serverPublicIp}`, 'info');
+                });
+            }
+        }
+        window.copyPublicIp = copyPublicIp;
+
+        function initRealtimeSync() {
+            try {
+                if (typeof io !== 'undefined') {
+                    const serverUrl = window.location.protocol.startsWith('http') ? window.location.origin : 'http://localhost:3000';
+                    syncSocket = io(serverUrl, {
+                        reconnection: true,
+                        reconnectionAttempts: 10,
+                        reconnectionDelay: 1000
+                    });
+
+                    syncSocket.on('connect', () => {
+                        console.log('[Sync] Connected to server as:', CLIENT_ID);
+                        updateSyncStatus('online', 1);
+                    });
+
+                    syncSocket.on('tunnel:ready', (data) => {
+                        console.log('[Sync] Public tunnel is ready:', data.publicUrl);
+                        if (data.publicUrl) serverPublicUrl = data.publicUrl;
+                        if (data.publicIp) serverPublicIp = data.publicIp;
+                        if (data.ips) serverNetworkIps = data.ips;
+                        renderShareLinks();
+                        showToast('🌍 ลิงก์อินเทอร์เน็ตภายนอกพร้อมใช้งานแล้ว', 'success');
+                    });
+
+                    syncSocket.on('clients:count', (data) => {
+                        if (data.publicUrl) serverPublicUrl = data.publicUrl;
+                        if (data.publicIp) serverPublicIp = data.publicIp;
+                        if (data.ips) serverNetworkIps = data.ips;
+                        if (data.port) serverPort = data.port;
+                        updateSyncStatus('online', data.count, data.ips, data.port);
+                    });
+
+                    syncSocket.on('sync:initial', (data) => {
+                        console.log('[Sync] Received initial state:', data);
+                        if (data.publicUrl) serverPublicUrl = data.publicUrl;
+                        if (data.publicIp) serverPublicIp = data.publicIp;
+                        if (data.serverIps) serverNetworkIps = data.serverIps;
+                        if (data.port) serverPort = data.port;
+                        if (data.slideEdits) {
+                            for (const [slideNumStr, content] of Object.entries(data.slideEdits)) {
+                                const num = parseInt(slideNumStr, 10);
+                                if (!Number.isFinite(num)) continue;
+                                slideEdits[num] = content;
+
+                                const slideEl = document.querySelector(`.slide-item[data-slide="${num}"]`);
+                                if (slideEl) {
+                                    slideEl.innerHTML = content;
+                                    injectSlideEditControls(slideEl, num);
+                                }
+                            }
+                            if (isEditMode) updateContentEditableState();
+                        }
+                        updateSyncStatus('online', data.activeClients, data.serverIps, data.port);
+                    });
+
+                    // Broadcast listener from another device
+                    syncSocket.on('slide:updated', (data) => {
+                        if (data.senderId === CLIENT_ID) return;
+                        const { slideNum, content, author } = data;
+                        console.log(`[Sync] Incoming update for Slide ${slideNum} from ${author || 'remote'}`);
+
+                        slideEdits[slideNum] = content;
+                        const slideEl = document.querySelector(`.slide-item[data-slide="${slideNum}"]`);
+                        if (slideEl) {
+                            slideEl.innerHTML = content;
+                            injectSlideEditControls(slideEl, slideNum);
+                            if (isEditMode && currentSlide === slideNum) {
+                                updateContentEditableState();
+                            }
+                        }
+                        showToast(`⚡ อัปเดตสไลด์ที่ ${slideNum} จากเครื่องอื่นเรียบร้อยแล้ว`, 'info');
+                    });
+
+                    // Reset listener from another device
+                    syncSocket.on('slide:reseted', (data) => {
+                        if (data.senderId === CLIENT_ID) return;
+                        const { slideNum } = data;
+                        console.log(`[Sync] Incoming reset for Slide ${slideNum}`);
+
+                        delete slideEdits[slideNum];
+                        const slideEl = document.querySelector(`.slide-item[data-slide="${slideNum}"]`);
+                        if (slideEl && originalSlideSnapshots[slideNum]) {
+                            slideEl.innerHTML = originalSlideSnapshots[slideNum];
+                            injectSlideEditControls(slideEl, slideNum);
+                            if (isEditMode && currentSlide === slideNum) {
+                                updateContentEditableState();
+                            }
+                        }
+                        showToast(`🔄 สไลด์ที่ ${slideNum} ถูกคืนค่าเริ่มต้นจากเครื่องอื่น`, 'info');
+                    });
+
+                    syncSocket.on('disconnect', () => {
+                        console.log('[Sync] Disconnected from server.');
+                        updateSyncStatus('offline');
+                    });
+
+                    syncSocket.on('connect_error', () => {
+                        updateSyncStatus('offline');
+                    });
+                } else {
+                    updateSyncStatus('offline');
+                }
+            } catch (err) {
+                console.warn('Real-time sync init error:', err);
+                updateSyncStatus('offline');
+            }
+        }
+
+        function openShareModal() {
+            const modal = document.getElementById('shareModal');
+            if (modal) {
+                modal.classList.remove('hidden');
+                modal.style.display = 'flex';
+                renderShareLinks();
+            }
+        }
+
+        function closeShareModal() {
+            const modal = document.getElementById('shareModal');
+            if (modal) {
+                modal.classList.add('hidden');
+                modal.style.display = 'none';
+            }
+        }
+
+        function copyToClipboard(inputId, toastMessage = 'คัดลอกแล้ว') {
+            const el = document.getElementById(inputId);
+            if (el) {
+                el.select();
+                navigator.clipboard.writeText(el.value).then(() => {
+                    showToast(toastMessage, 'success');
+                }).catch(() => {
+                    document.execCommand('copy');
+                    showToast(toastMessage, 'success');
+                });
+            }
+        }
+
+        window.openShareModal = openShareModal;
+        window.closeShareModal = closeShareModal;
+        window.copyToClipboard = copyToClipboard;
+
         // MAIN PRESENTATION CONTROLLER
         // =========================================================================
         document.addEventListener('DOMContentLoaded', () => {
@@ -4680,6 +5074,20 @@
 
             // Initialize Editable System on all slides
             initSlideEditing(slides);
+            
+            // Live typing input listener to auto-sync changes
+            document.addEventListener('input', (e) => {
+                if (!isEditMode) return;
+                if (e.target.isContentEditable) {
+                    clearTimeout(autoSyncDebounceTimer);
+                    autoSyncDebounceTimer = setTimeout(() => {
+                        saveCurrentSlideEdits(true);
+                    }, 1000);
+                }
+            });
+
+            // Start Real-time Multi-device Online Synchronization
+            initRealtimeSync();
 
             // Interactive Step Switcher Logic for Slide 30
             const stepInfo = {
@@ -5308,7 +5716,7 @@
             </span>
         </div>
 
-        <!-- Text formatting -->
+        <!-- Text formatting & Font size -->
         <div class="flex items-center gap-1">
             <button type="button" onmousedown="event.preventDefault(); document.execCommand('bold', false, null);" title="ตัวหนา (Ctrl+B)" class="edit-tool-btn font-bold">B</button>
             <button type="button" onmousedown="event.preventDefault(); document.execCommand('italic', false, null);" title="ตัวเอียง (Ctrl+I)" class="edit-tool-btn italic font-serif">I</button>
@@ -5318,6 +5726,46 @@
             </button>
             <button type="button" onmousedown="event.preventDefault(); applyTextColor('#059669');" title="เปลี่ยนสีตัวอักษรเป็นเขียวมรกต" class="edit-tool-btn text-emerald-400">
                 <i class="fa-solid fa-palette text-xs"></i>
+            </button>
+        </div>
+
+        <div class="edit-tool-divider"></div>
+
+        <!-- Font Size Adjustment -->
+        <div class="flex items-center gap-1">
+            <button type="button" onmousedown="event.preventDefault(); changeSelectedFontSize(-2);" title="ลดขนาดตัวอักษร (A-)" class="edit-tool-btn text-xs font-bold flex items-center justify-center">
+                A<span class="text-[9px] -mt-1 font-bold">-</span>
+            </button>
+            
+            <select id="fontSizeSelector" onchange="applyPresetFontSize(this.value); this.value='';" onmousedown="saveSelectionRange();" title="เลือกขนาดตัวอักษร" class="bg-slate-800 text-slate-200 text-[11px] font-semibold rounded-lg px-2 py-1 border border-slate-700 focus:outline-none focus:border-emerald-500 cursor-pointer h-[1.95rem]">
+                <option value="">ขนาด...</option>
+                <option value="11px">11 เล็กมาก</option>
+                <option value="13px">13 เล็ก</option>
+                <option value="15px">15 ปกติ</option>
+                <option value="18px">18 ปานกลาง</option>
+                <option value="22px">22 ใหญ่</option>
+                <option value="28px">28 ใหญ่มาก</option>
+                <option value="36px">36 หัวข้อ</option>
+                <option value="48px">48 พาดหัว</option>
+            </select>
+
+            <button type="button" onmousedown="event.preventDefault(); changeSelectedFontSize(2);" title="เพิ่มขนาดตัวอักษร (A+)" class="edit-tool-btn text-xs font-bold flex items-center justify-center">
+                A<span class="text-[9px] -mt-1 font-bold">+</span>
+            </button>
+        </div>
+
+        <div class="edit-tool-divider"></div>
+
+        <!-- Text Alignment -->
+        <div class="flex items-center gap-0.5">
+            <button type="button" onmousedown="event.preventDefault(); document.execCommand('justifyLeft', false, null);" title="จัดชิดซ้าย" class="edit-tool-btn text-xs">
+                <i class="fa-solid fa-align-left"></i>
+            </button>
+            <button type="button" onmousedown="event.preventDefault(); document.execCommand('justifyCenter', false, null);" title="จัดกึ่งกลาง" class="edit-tool-btn text-xs">
+                <i class="fa-solid fa-align-center"></i>
+            </button>
+            <button type="button" onmousedown="event.preventDefault(); document.execCommand('justifyRight', false, null);" title="จัดชิดขวา" class="edit-tool-btn text-xs">
+                <i class="fa-solid fa-align-right"></i>
             </button>
         </div>
 
@@ -5349,6 +5797,139 @@
             <button type="button" onclick="toggleEditMode(false)" title="ปิดโหมดแก้ไข" class="w-7 h-7 flex items-center justify-center rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-400 hover:text-white transition ml-0.5 cursor-pointer">
                 <i class="fa-solid fa-xmark text-sm"></i>
             </button>
+        </div>
+    </div>
+
+
+    <!-- MULTI-DEVICE & ONLINE SYNC MODAL -->
+    <div id="shareModal" onclick="if(event.target===this)closeShareModal()" class="fixed inset-0 z-50 bg-slate-900/70 backdrop-blur-xs flex items-center justify-center p-4 hidden font-sarabun" style="display: none;">
+        <div class="bg-white rounded-3xl shadow-2xl max-w-2xl w-full border border-slate-200 overflow-hidden transform transition-all animate-in fade-in zoom-in-95 duration-200">
+            <!-- Header -->
+            <div class="p-5 bg-gradient-to-r from-blue-900 via-indigo-900 to-slate-900 text-white flex items-center justify-between border-b border-blue-800">
+                <div class="flex items-center gap-3">
+                    <div class="w-10 h-10 rounded-2xl bg-blue-500/20 text-blue-400 border border-blue-500/30 flex items-center justify-center text-lg">
+                        <i class="fa-solid fa-tower-broadcast"></i>
+                    </div>
+                    <div>
+                        <h3 class="text-base font-extrabold tracking-wide">ศูนย์เชื่อมต่อออนไลน์ & แชร์หลายเครื่อง (Real-Time Sync)</h3>
+                        <p class="text-xs text-blue-200">แก้ไขข้อความจากเครื่องใด เครื่องอื่นๆ ที่เปิดอยู่จะเปลี่ยนตามทันทีแบบสด!</p>
+                    </div>
+                </div>
+                <button onclick="closeShareModal()" class="w-8 h-8 rounded-full bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white flex items-center justify-center transition">
+                    <i class="fa-solid fa-xmark text-sm"></i>
+                </button>
+            </div>
+
+            <!-- Content -->
+            <div class="p-6 space-y-4 max-h-[75vh] overflow-y-auto custom-scrollbar bg-slate-50/50">
+                <!-- Status Banner -->
+                <div class="p-4 rounded-2xl bg-white border border-blue-100 shadow-xs flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <span id="modalStatusDot" class="w-3.5 h-3.5 rounded-full bg-emerald-500 shadow-xs shadow-emerald-500/50 animate-pulse"></span>
+                        <div>
+                            <div class="text-xs font-bold text-slate-900" id="modalStatusTitle">สถานะการเชื่อมต่อ: ออนไลน์ (Real-time Sync Active)</div>
+                            <div class="text-[11px] text-slate-500" id="modalStatusDetail">เชื่อมต่อกับเซิร์ฟเวอร์เรียบร้อยแล้ว</div>
+                        </div>
+                    </div>
+                    <span id="activeClientsBadge" class="px-3 py-1 bg-emerald-100 text-emerald-800 text-xs font-bold rounded-full border border-emerald-300">
+                        🟢 ออนไลน์ 1 เครื่อง
+                    </span>
+                </div>
+
+                <!-- URLs & QR Code Grid -->
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <!-- Left: Links (Public Internet & Local) -->
+                    <div class="space-y-2.5">
+                        <!-- Public Internet HTTPS URL Card -->
+                        <div class="p-3 rounded-xl bg-gradient-to-r from-emerald-50 to-teal-50 border-2 border-emerald-400/80 shadow-xs">
+                            <div class="flex items-center justify-between mb-1">
+                                <label class="text-[11px] font-extrabold text-emerald-950 flex items-center gap-1.5">
+                                    <i class="fa-solid fa-earth-americas text-emerald-600 animate-pulse"></i> ลิงก์อินเทอร์เน็ตภายนอก (4G/5G/บ้าน):
+                                </label>
+                                <span class="px-2 py-0.5 bg-emerald-600 text-white text-[9px] font-bold rounded-full shadow-2xs">เปิดได้ทั่วโลก 🌍</span>
+                            </div>
+                            <div class="flex items-center gap-1.5">
+                                <input id="publicUrlInput" type="text" readonly value="กำลังสร้างลิงก์ภายนอก..." class="w-full text-xs p-2 rounded-lg bg-white border border-emerald-300 font-mono text-emerald-900 font-bold select-all shadow-inner">
+                                <button onclick="copyToClipboard('publicUrlInput', 'คัดลอกลิงก์อินเทอร์เน็ตภายนอกแล้ว 🌍')" class="px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold shrink-0 transition flex items-center gap-1 shadow-xs cursor-pointer">
+                                    <i class="fa-solid fa-copy"></i>
+                                </button>
+                            </div>
+                            <div id="tunnelIpPassHint" class="mt-1.5 text-[10px] text-emerald-800 flex items-center justify-between">
+                                <span>🔑 รหัสผ่านหากถามตอนเปิดครั้งแรก (IP): <strong id="publicIpBadge" class="font-mono bg-emerald-100 px-1.5 py-0.5 rounded text-emerald-900 select-all">-</strong></span>
+                                <button onclick="copyPublicIp()" class="text-[9px] text-emerald-700 underline font-bold hover:text-emerald-900 cursor-pointer">คัดลอก IP</button>
+                            </div>
+                        </div>
+
+                        <!-- Local Wi-Fi URL Card -->
+                        <div class="p-3 rounded-xl bg-white border border-slate-200 shadow-xs">
+                            <label class="block text-[11px] font-bold text-slate-700 mb-1 flex items-center gap-1.5">
+                                <i class="fa-solid fa-wifi text-blue-600"></i> ลิงก์สำหรับเครื่องในวง Wi-Fi เดียวกัน (LAN):
+                            </label>
+                            <div class="flex items-center gap-1.5">
+                                <input id="networkUrlInput" type="text" readonly value="กำลังค้นหา IP..." class="w-full text-xs p-2 rounded-lg bg-slate-50 border border-slate-200 font-mono text-slate-700 select-all">
+                                <button onclick="copyToClipboard('networkUrlInput', 'คัดลอกลิงก์ Wi-Fi แล้ว')" class="px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold shrink-0 transition flex items-center gap-1 cursor-pointer">
+                                    <i class="fa-solid fa-copy"></i>
+                                </button>
+                            </div>
+                        </div>
+
+                        <!-- Localhost Card -->
+                        <div class="p-2.5 rounded-xl bg-slate-50 border border-slate-200 flex items-center justify-between">
+                            <div class="flex items-center gap-2">
+                                <i class="fa-solid fa-laptop text-slate-500 text-xs"></i>
+                                <span class="text-[11px] text-slate-600 font-medium">เครื่องนี้:</span>
+                                <code id="localUrlText" class="text-[11px] font-mono text-slate-800 bg-white px-1.5 py-0.5 rounded border border-slate-200">http://localhost:3000</code>
+                            </div>
+                            <button onclick="copyToClipboard('localUrlInput', 'คัดลอกลิงก์ Localhost แล้ว')" class="px-2 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-[10px] font-bold transition flex items-center gap-1 cursor-pointer">
+                                <i class="fa-solid fa-copy"></i> คัดลอก
+                            </button>
+                            <input id="localUrlInput" type="hidden" value="http://localhost:3000">
+                        </div>
+                    </div>
+
+                    <!-- Right: Dynamic QR Code with Switcher -->
+                    <div class="p-3.5 rounded-xl bg-white border border-slate-200 shadow-xs flex flex-col items-center justify-between text-center">
+                        <div class="w-full flex items-center justify-between mb-1 pb-1 border-b border-slate-100">
+                            <span class="text-xs font-bold text-slate-800 flex items-center gap-1">
+                                <i class="fa-solid fa-qrcode text-indigo-600"></i> สแกน QR Code
+                            </span>
+                            <!-- QR Switcher Tabs -->
+                            <div class="inline-flex rounded-lg bg-slate-100 p-0.5 text-[10px] font-bold">
+                                <button id="qrTabPublic" type="button" onclick="switchQrCodeType('public')" class="px-2 py-1 rounded-md bg-white text-emerald-800 shadow-2xs cursor-pointer transition">เน็ตภายนอก 🌍</button>
+                                <button id="qrTabLan" type="button" onclick="switchQrCodeType('lan')" class="px-2 py-1 rounded-md text-slate-600 hover:text-slate-900 cursor-pointer transition">Wi-Fi 📶</button>
+                            </div>
+                        </div>
+
+                        <div id="qrcodeContainer" class="p-2.5 bg-white rounded-xl border border-slate-200 shadow-xs my-1 flex items-center justify-center min-w-[135px] min-h-[135px]">
+                            <!-- QRCode Generated Dynamically -->
+                        </div>
+                        <p id="qrTypeDescription" class="text-[10px] text-emerald-700 font-semibold mt-1">สแกนด้วยมือถือ 4G/5G หรือเน็ตบ้าน เพื่อเปิดแก้ไขร่วมกันได้ทันที</p>
+                    </div>
+                </div>
+
+                <!-- How it works guide -->
+                <div class="p-3.5 rounded-xl bg-blue-50/70 border border-blue-200 text-xs text-blue-900 flex items-start gap-3">
+                    <i class="fa-solid fa-circle-info text-base text-blue-600 shrink-0 mt-0.5"></i>
+                    <div>
+                        <strong class="block mb-0.5">วิธีใช้งานระบบออนไลน์:</strong>
+                        <span class="text-[11px] leading-relaxed text-blue-800">
+                            1. รันคำสั่ง <code class="bg-blue-100 px-1 py-0.5 rounded font-mono text-blue-900 font-bold">npm start</code> บนเครื่องแม่ข่าย<br>
+                            2. ส่งลิงก์ Wi-Fi หรือให้เพื่อนสแกน QR Code เข้ามา<br>
+                            3. เมื่อใครก็ตามกด "แก้ไขสไลด์นี้" และพิมพ์ข้อความ ทุกเครื่องที่เปิดสไลด์หน้านั้นอยู่จะเห็นข้อความเปลี่ยนตามทันที!
+                        </span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Footer -->
+            <div class="p-4 bg-slate-100 border-t border-slate-200 flex items-center justify-between text-xs text-slate-600">
+                <span class="flex items-center gap-1.5 text-emerald-700 font-semibold">
+                    <i class="fa-solid fa-bolt text-emerald-600"></i> WebSocket Real-time Broadcast Active
+                </span>
+                <button onclick="closeShareModal()" class="px-4 py-1.5 rounded-lg bg-slate-200 hover:bg-slate-300 text-slate-800 font-bold transition">
+                    ปิดหน้าต่าง
+                </button>
+            </div>
         </div>
     </div>
 
